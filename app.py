@@ -1,10 +1,24 @@
 from flask import Flask, render_template, request, redirect, session, url_for
-import sqlite3, os
+import sqlite3, os, boto3
 
+# === AWS Configuration ===
+AWS_REGION = 'us-east-1'
+USERS_TABLE = 'fixitnow_user'
+SERVICES_TABLE = 'fixitnow_service'
+SNS_TOPIC_ARN = "temp_arn"
+
+# Initialize AWS clients (future use)
+dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+sns_client = boto3.client('sns', region_name=AWS_REGION)
+users_table = dynamodb.Table(USERS_TABLE)
+services_table = dynamodb.Table(SERVICES_TABLE)
+
+# === Flask App Configuration ===
 app = Flask(__name__)
 app.secret_key = 'pickle_secret'
 DB = 'database.db'
 
+# === Database Setup ===
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -20,13 +34,14 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER, product_id INTEGER, quantity INTEGER, status TEXT)''')
 
-        # ✅ Create default admin if not exists
+        # Create default admin
         admin = c.execute("SELECT * FROM users WHERE username='admin'").fetchone()
         if not admin:
             c.execute("INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)",
                       ('admin', 'admin123', 1))
-
         conn.commit()
+
+# === Routes ===
 
 @app.route('/')
 def home():
@@ -48,28 +63,6 @@ def register():
             except sqlite3.IntegrityError:
                 return "Username already taken"
     return render_template('register.html')
-@app.route('/checkout', methods=['POST'])
-def checkout():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-
-    uid = session['user_id']
-    cart = session.get('cart', {})
-    payment_method = request.form.get('payment_method')
-
-    if not cart:
-        return "Cart is empty"
-
-    with sqlite3.connect(DB) as conn:
-        for pid, qty in cart.items():
-            conn.execute("INSERT INTO orders (user_id, product_id, quantity, status) VALUES (?, ?, ?, ?)",
-                         (uid, pid, qty, f"Confirmed ({payment_method})"))
-            conn.execute("UPDATE products SET quantity = quantity - ? WHERE id = ?", (qty, pid))
-        conn.commit()
-
-    session['cart'] = {}
-    return render_template('success.html')
-
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -112,7 +105,29 @@ def cart():
                 total += product[2] * qty
     return render_template('cart.html', items=items, total=total)
 
-# === Admin Section ===
+@app.route('/checkout', methods=['POST'])
+def checkout():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+
+    uid = session['user_id']
+    cart = session.get('cart', {})
+    payment_method = request.form.get('payment_method')
+
+    if not cart:
+        return "Cart is empty"
+
+    with sqlite3.connect(DB) as conn:
+        for pid, qty in cart.items():
+            conn.execute("INSERT INTO orders (user_id, product_id, quantity, status) VALUES (?, ?, ?, ?)",
+                         (uid, pid, qty, f"Confirmed ({payment_method})"))
+            conn.execute("UPDATE products SET quantity = quantity - ? WHERE id = ?", (qty, pid))
+        conn.commit()
+
+    session['cart'] = {}
+    return render_template('success.html')
+
+# === Admin Routes ===
 
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
@@ -171,6 +186,7 @@ def admin_orders():
         ''').fetchall()
     return render_template('admin_orders.html', orders=orders)
 
+# === Entry Point ===
 if __name__ == '__main__':
     if not os.path.exists(DB):
         init_db()
@@ -181,5 +197,5 @@ if __name__ == '__main__':
                          ('Lemon Pickle', 120, 15, '/static/images/lemon.jpg'))
             conn.commit()
     else:
-        init_db()  # ensure tables exist even if DB file exists
+        init_db()
     app.run(debug=True)
