@@ -212,6 +212,6 @@ def service_request():
     return render_template('service_form.html')
 
 # === App Runner ===
-if __name__ == '__main__':
+if __name__ == "__main__":
     init_admin()
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
