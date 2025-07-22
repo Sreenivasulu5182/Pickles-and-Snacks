@@ -1,81 +1,76 @@
 from flask import Flask, render_template, request, redirect, session, url_for
-import sqlite3, os, boto3
+import boto3, os, uuid
 
 # === AWS Configuration ===
 AWS_REGION = 'us-east-1'
-USERS_TABLE = 'fixitnow_user'
-SERVICES_TABLE = 'fixitnow_service'
-SNS_TOPIC_ARN = "temp_arn"
+USERS_TABLE = 'user'
+PRODUCTS_TABLE = 'product'
+ORDERS_TABLE = 'order'
+SERVICES_TABLE = 'service'
+SNS_TOPIC_ARN = "your_sns_topic_arn_here"
 
-# Initialize AWS clients (future use)
+# Initialize AWS clients
 dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
 sns_client = boto3.client('sns', region_name=AWS_REGION)
 users_table = dynamodb.Table(USERS_TABLE)
+products_table = dynamodb.Table(PRODUCTS_TABLE)
+orders_table = dynamodb.Table(ORDERS_TABLE)
 services_table = dynamodb.Table(SERVICES_TABLE)
 
-# === Flask App Configuration ===
 app = Flask(__name__)
 app.secret_key = 'pickle_secret'
-DB = 'database.db'
 
-# === Database Setup ===
-def init_db():
-    with sqlite3.connect(DB) as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            password TEXT,
-            is_admin INTEGER DEFAULT 0)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT, price REAL, quantity INTEGER, image TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, product_id INTEGER, quantity INTEGER, status TEXT)''')
-
-        # Create default admin
-        admin = c.execute("SELECT * FROM users WHERE username='admin'").fetchone()
-        if not admin:
-            c.execute("INSERT INTO users (username, password, is_admin) VALUES (?, ?, ?)",
-                      ('admin', 'admin123', 1))
-        conn.commit()
-
-# === Routes ===
+# === Init Admin User ===
+def init_admin():
+    try:
+        res = users_table.get_item(Key={'username': 'admin'})
+        if 'Item' not in res:
+            users_table.put_item(Item={
+                'username': 'admin',
+                'password': 'admin123',
+                'is_admin': True
+            })
+            print("✅ Admin user created.")
+    except Exception as e:
+        print(f"❌ Error initializing admin: {e}")
 
 @app.route('/')
 def home():
     if 'user_id' not in session:
         return redirect(url_for('login'))
-    with sqlite3.connect(DB) as conn:
-        products = conn.execute("SELECT * FROM products").fetchall()
-    return render_template('index.html', products=products)
+    try:
+        response = products_table.scan()
+        products = response.get('Items', [])
+        return render_template('index.html', products=products)
+    except Exception as e:
+        return f"Error loading products: {e}"
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
         username, password = request.form['username'], request.form['password']
-        with sqlite3.connect(DB) as conn:
-            try:
-                conn.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
-                conn.commit()
-                return redirect(url_for('login'))
-            except sqlite3.IntegrityError:
-                return "Username already taken"
+        try:
+            users_table.put_item(Item={
+                'username': username,
+                'password': password,
+                'is_admin': False
+            }, ConditionExpression='attribute_not_exists(username)')
+            return redirect(url_for('login'))
+        except Exception:
+            return "Username already exists"
     return render_template('register.html')
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         username, password = request.form['username'], request.form['password']
-        with sqlite3.connect(DB) as conn:
-            user = conn.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password)).fetchone()
-            if user:
-                session['user_id'] = user[0]
-                session['username'] = user[1]
-                return redirect(url_for('home'))
-            else:
-                return "Invalid credentials"
+        res = users_table.get_item(Key={'username': username})
+        user = res.get('Item')
+        if user and user['password'] == password:
+            session['user_id'] = username
+            session['username'] = username
+            return redirect(url_for('home'))
+        return "Invalid credentials"
     return render_template('login.html')
 
 @app.route('/logout')
@@ -83,12 +78,12 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
-@app.route('/add_to_cart/<int:pid>')
+@app.route('/add_to_cart/<string:pid>')
 def add_to_cart(pid):
     if 'user_id' not in session:
         return redirect(url_for('login'))
     cart = session.get('cart', {})
-    cart[str(pid)] = cart.get(str(pid), 0) + 1
+    cart[pid] = cart.get(pid, 0) + 1
     session['cart'] = cart
     return redirect(url_for('cart'))
 
@@ -97,12 +92,11 @@ def cart():
     if 'user_id' not in session:
         return redirect(url_for('login'))
     items, total = [], 0
-    with sqlite3.connect(DB) as conn:
-        for pid, qty in session.get('cart', {}).items():
-            product = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
-            if product:
-                items.append((product, qty))
-                total += product[2] * qty
+    for pid, qty in session.get('cart', {}).items():
+        product = products_table.get_item(Key={'product_id': pid}).get('Item')
+        if product:
+            items.append((product, qty))
+            total += float(product['price']) * qty
     return render_template('cart.html', items=items, total=total)
 
 @app.route('/checkout', methods=['POST'])
@@ -110,21 +104,43 @@ def checkout():
     if 'user_id' not in session:
         return redirect(url_for('login'))
 
-    uid = session['user_id']
     cart = session.get('cart', {})
     payment_method = request.form.get('payment_method')
+    username = session['username']
+    order_summary = []
 
-    if not cart:
-        return "Cart is empty"
-
-    with sqlite3.connect(DB) as conn:
-        for pid, qty in cart.items():
-            conn.execute("INSERT INTO orders (user_id, product_id, quantity, status) VALUES (?, ?, ?, ?)",
-                         (uid, pid, qty, f"Confirmed ({payment_method})"))
-            conn.execute("UPDATE products SET quantity = quantity - ? WHERE id = ?", (qty, pid))
-        conn.commit()
+    for pid, qty in cart.items():
+        product = products_table.get_item(Key={'product_id': pid}).get('Item')
+        if not product:
+            continue
+        order_id = str(uuid.uuid4())
+        orders_table.put_item(Item={
+            'order_id': order_id,
+            'username': username,
+            'product_id': pid,
+            'quantity': qty,
+            'status': f'Confirmed ({payment_method})'
+        })
+        products_table.update_item(
+            Key={'product_id': pid},
+            UpdateExpression="SET quantity = quantity - :val",
+            ExpressionAttributeValues={':val': qty}
+        )
+        order_summary.append(f"{product['name']} x{qty}")
 
     session['cart'] = {}
+
+    # ✅ SNS notification
+    try:
+        message = f"Hi {username}, your order is confirmed:\n" + "\n".join(order_summary)
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Message=message,
+            Subject='Order Confirmation'
+        )
+    except Exception as e:
+        print("SNS Error:", e)
+
     return render_template('success.html')
 
 # === Admin Routes ===
@@ -134,12 +150,10 @@ def admin_login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        with sqlite3.connect(DB) as conn:
-            user = conn.execute("SELECT * FROM users WHERE username=? AND password=? AND is_admin=1", (username, password)).fetchone()
-            if user:
-                session['admin_id'] = user[0]
-                session['admin_username'] = user[1]
-                return redirect(url_for('admin_dashboard'))
+        user = users_table.get_item(Key={'username': username}).get('Item')
+        if user and user.get('password') == password and user.get('is_admin'):
+            session['admin_id'] = username
+            return redirect(url_for('admin_dashboard'))
         return "Invalid admin credentials"
     return render_template('admin_login.html')
 
@@ -154,14 +168,15 @@ def admin_add_product():
     if 'admin_id' not in session:
         return redirect(url_for('admin_login'))
     if request.method == 'POST':
-        name = request.form['name']
-        price = float(request.form['price'])
-        quantity = int(request.form['quantity'])
-        image = request.form['image'] or '/static/images/pickle1.jpg'
-        with sqlite3.connect(DB) as conn:
-            conn.execute("INSERT INTO products (name, price, quantity, image) VALUES (?, ?, ?, ?)",
-                         (name, price, quantity, image))
-            conn.commit()
+        pid = str(uuid.uuid4())
+        product = {
+            'product_id': pid,
+            'name': request.form['name'],
+            'price': float(request.form['price']),
+            'quantity': int(request.form['quantity']),
+            'image': request.form['image'] or '/static/images/pickle1.jpg'
+        }
+        products_table.put_item(Item=product)
         return redirect(url_for('admin_dashboard'))
     return render_template('admin_add.html')
 
@@ -169,33 +184,34 @@ def admin_add_product():
 def admin_stock():
     if 'admin_id' not in session:
         return redirect(url_for('admin_login'))
-    with sqlite3.connect(DB) as conn:
-        products = conn.execute("SELECT * FROM products").fetchall()
+    products = products_table.scan().get('Items', [])
     return render_template('admin_stock.html', products=products)
 
 @app.route('/admin/orders')
 def admin_orders():
     if 'admin_id' not in session:
         return redirect(url_for('admin_login'))
-    with sqlite3.connect(DB) as conn:
-        orders = conn.execute('''
-            SELECT o.id, u.username, p.name, o.quantity, o.status
-            FROM orders o
-            JOIN users u ON o.user_id = u.id
-            JOIN products p ON o.product_id = p.id
-        ''').fetchall()
+    orders = orders_table.scan().get('Items', [])
     return render_template('admin_orders.html', orders=orders)
 
-# === Entry Point ===
+# === Service Request (optional) ===
+@app.route('/service-request', methods=['GET', 'POST'])
+def service_request():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    if request.method == 'POST':
+        service = {
+            'service_id': str(uuid.uuid4()),
+            'username': session['username'],
+            'type': request.form['type'],
+            'description': request.form['description'],
+            'status': 'Pending'
+        }
+        services_table.put_item(Item=service)
+        return "Service request submitted!"
+    return render_template('service_form.html')
+
+# === App Runner ===
 if __name__ == '__main__':
-    if not os.path.exists(DB):
-        init_db()
-        with sqlite3.connect(DB) as conn:
-            conn.execute("INSERT INTO products (name, price, quantity, image) VALUES (?, ?, ?, ?)",
-                         ('Mango Pickle', 150, 20, '/static/images/mango.jpg'))
-            conn.execute("INSERT INTO products (name, price, quantity, image) VALUES (?, ?, ?, ?)",
-                         ('Lemon Pickle', 120, 15, '/static/images/lemon.jpg'))
-            conn.commit()
-    else:
-        init_db()
+    init_admin()
     app.run(debug=True)
