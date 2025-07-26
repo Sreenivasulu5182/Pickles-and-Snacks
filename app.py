@@ -7,7 +7,7 @@ USERS_TABLE = 'user'
 PRODUCTS_TABLE = 'product'
 ORDERS_TABLE = 'order'
 SERVICES_TABLE = 'service'
-SNS_TOPIC_ARN = "your_sns_topic_arn_here"
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:051826710082:Pickles-snacks_topic"
 
 # Initialize AWS clients
 dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
